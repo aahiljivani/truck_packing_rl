@@ -1,0 +1,119 @@
+we have to post the response back to the api using requests.post
+action_space: position is where you place it and orientation is how
+action_space: "posiiton": [x,y,z], orientation [w,x,y,z]
+
+
+print(game)
+output:
+ {'game_id': 'g_a01a00976c8e', 'truck': {'depth': 2.0, 'width': 2.6, 'height': 2.75},
+'current_box': {'id': '1767904644487073895', 'dimensions': [0.232, 0.269, 0.251], 'weight': 8.85},
+ 'boxes_remaining': 915, 'mode': 'dev'}
+
+ print(resp)
+ output:
+ {'status': 'ok', 'placed_boxes': [{'id': '1767903600237971767', 'position': [0.1375, 0.19, 0.0905],
+'orientation_wxyz': [1.0, 0.0, 0.0, 0.0], 'dimensions': [0.275, 0.38, 0.181]}],
+ 'current_box': {'id': '1767897191802239403', 'dimensions': [0.277, 0.321, 0.336], 'weight': 3.37},
+  'boxes_remaining': 914, 'density': 0.009619580419580418, 
+  'game_status': 'in_progress', 'termination_reason': None, 'decision_latency_ms': 143.6}
+
+
+
+we need to make obs, reward, terminated, trunc, info
+function for turning status into trunc boolean value 
+function for turning game_status into boolean value for truncated (if 'status': 'ok' == False)
+
+obs = 'truck' , current_box, placed_boxes, density, 
+info = boxes_remaining, termination_reason, game_id, decision_latency_ms
+
+
+We need :
+1. env.reset(seed=42)
+2. env.action_space.sample
+env.observation_space
+env.step
+
+
+3. CLI surface (Args dataclass)
+
+Add / change:
+
+
+
+
+
+env_id default becomes "TruckEnv-v0" (cosmetic, used only for run_name).
+
+
+
+env_mode: str = "dev" (forwarded to MujocoTruckEnv(mode=...)).
+
+
+
+api_key: str = API_KEY (so you can override on CLI).
+
+
+
+n_boxes: int = 20.
+
+
+
+total_episodes: int = 100 (new episode-based stopping; outer loop breaks once reached).
+
+
+
+total_timesteps: int = 100_000 (kept as hard safety ceiling).
+
+
+
+learning_starts: int = 200 (down from 5000 so SAC actually starts updating within the smoke run).
+
+
+
+buffer_size: int = int(5e4) (right-sized; 1e6 is overkill for 100 episodes).
+
+
+
+render: bool = False (new; launches the MuJoCo passive viewer so you can watch training live). Default false = headless, matching test.py's --headless semantics.
+
+
+
+n_sequences: int = 10 (new; pool of pre-fetched box sequences shared across all parallel envs — see §8d). Setting --n-sequences 0 opts out and falls back to per-env API fetches (only sensible at num_envs=1).
+
+
+
+Remove capture_video.
+
+
+
+cd /Users/aahiljivani/Desktop/MIRL_lab/mujoco
+
+# Headless smoke test (primary verification path, num_envs=1, 10-sequence pool)
+python sac.py --num-envs 1 --total-episodes 100 --n-boxes 20 --n-sequences 10
+
+# MacBook Pro — SAC smoke with ONE env, NOT headless (viewer on env 0 only; §9a K=1)
+# Use mjpython on macOS. Deliberately NOT --num-envs 8 or 20 here.
+mjpython sac.py --num-envs 1 --render --render-envs 1 \
+    --total-episodes 20 --n-boxes 20 --n-sequences 10
+
+# Optional: shorter visual spot-check on Mac
+mjpython sac.py --num-envs 1 --render --render-envs 1 --total-episodes 5 --n-boxes 5 --n-sequences 3
+
+# Linux — parallel + K viewers (§9a): 4 sims, 4 windows (heavy)
+python sac.py --num-envs 4 --render --render-envs 4 --total-episodes 10 --n-boxes 20 --n-sequences 5
+
+# Parallel training on the linux RTX 5070 Ti / Ryzen 9950X box
+python sac.py \
+    --num-envs 8 \
+    --total-episodes 1000 \
+    --n-boxes 100 \
+    --n-sequences 20 \
+    --learning-starts 2000 \
+    --buffer-size 400000 \
+    --total-timesteps 1000000
+
+# Parallel + watch env 0 in the viewer (linux)
+python sac.py --render --num-envs 8 --total-episodes 50 --n-boxes 20 --n-sequences 10
+
+# Inspect metrics
+tensorboard --logdir runs
