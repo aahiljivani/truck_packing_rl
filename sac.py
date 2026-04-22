@@ -78,6 +78,8 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
+    resume: str | None = None
+    """Path to a checkpoint .pt to continue training from (actor, critics, optimizers, log_alpha)"""
 
 
 def make_truck_env(
@@ -179,7 +181,7 @@ class Actor(nn.Module):
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.exp_name}__n{args.n_boxes}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
 
@@ -267,6 +269,31 @@ if __name__ == "__main__":
     else:
         alpha = args.alpha
 
+    resumed = False
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        actor.load_state_dict(ckpt["actor"])
+        qf1.load_state_dict(ckpt["qf1"])
+        qf2.load_state_dict(ckpt["qf2"])
+        qf1_target.load_state_dict(ckpt["qf1_target"])
+        qf2_target.load_state_dict(ckpt["qf2_target"])
+        if "actor_optimizer" in ckpt:
+            actor_optimizer.load_state_dict(ckpt["actor_optimizer"])
+        if "q_optimizer" in ckpt:
+            q_optimizer.load_state_dict(ckpt["q_optimizer"])
+        if args.autotune and ckpt.get("log_alpha") is not None:
+            with torch.no_grad():
+                log_alpha.copy_(ckpt["log_alpha"].to(device))
+            alpha = log_alpha.exp().item()
+            if ckpt.get("a_optimizer") is not None:
+                a_optimizer.load_state_dict(ckpt["a_optimizer"])
+        resumed = True
+        print(
+            f"[resume] Loaded {args.resume} "
+            f"(prev global_step={ckpt.get('global_step')}, "
+            f"prev episode_count={ckpt.get('episode_count')})"
+        )
+
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
         args.buffer_size,
@@ -283,7 +310,9 @@ if __name__ == "__main__":
     episode_count = 0
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
-        if global_step < args.learning_starts:
+        # On resume, skip uniform-random exploration and use the loaded policy
+        # to refill the (fresh) replay buffer with on-policy-quality data.
+        if global_step < args.learning_starts and not resumed:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
@@ -401,22 +430,27 @@ if __name__ == "__main__":
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
 # save model to folder model and name them based on the algorithm name and index
     os.makedirs("model", exist_ok=True)
-    pattern = re.compile(rf"^{re.escape(args.exp_name)}_(\d+)\.pt$")
+    prefix = f"{args.exp_name}_n{args.n_boxes}"
+    pattern = re.compile(rf"^{re.escape(prefix)}_(\d+)\.pt$")
     existing = [int(m.group(1)) for f in os.listdir("model") if (m := pattern.match(f))]
     next_idx = max(existing, default=0) + 1
-    model_path = os.path.join("model", f"{args.exp_name}_{next_idx}.pt")
+    model_path = os.path.join("model", f"{prefix}_{next_idx}.pt")
 
-    torch.save(
-        {
-            "actor": actor.state_dict(),
-            "qf1": qf1.state_dict(),
-            "qf2": qf2.state_dict(),
-            "qf1_target": qf1_target.state_dict(),
-            "qf2_target": qf2_target.state_dict(),
-            "args": vars(args),
-        },
-        model_path,
-    )
+    ckpt = {
+        "actor": actor.state_dict(),
+        "qf1": qf1.state_dict(),
+        "qf2": qf2.state_dict(),
+        "qf1_target": qf1_target.state_dict(),
+        "qf2_target": qf2_target.state_dict(),
+        "actor_optimizer": actor_optimizer.state_dict(),
+        "q_optimizer": q_optimizer.state_dict(),
+        "log_alpha": log_alpha.detach().cpu() if args.autotune else None,
+        "a_optimizer": a_optimizer.state_dict() if args.autotune else None,
+        "global_step": int(global_step),
+        "episode_count": int(episode_count),
+        "args": vars(args),
+    }
+    torch.save(ckpt, model_path)
     print(f"[save] Model saved to {model_path}")
 
     envs.close()

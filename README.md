@@ -265,28 +265,61 @@ For each step:
 
 ## Current Reward Design
 
-Reward shaping is being actively iterated. At the moment, the reward in `mjc.py` is centered on two ideas:
+The reward is deliberately minimal. Most of the shaping lives in the
+termination ladder rather than the per-step signal, on the premise that
+the agent already sees enough state (the stability, count, and height
+grids) to learn stability implicitly. The per-step reward should stay
+close to the true objective: pack as much volume as possible into as
+little depth as possible without toppling.
 
-- strongly reward increases in density
-- penalize placements with larger `x` depth values
-
-The current step reward is approximately:
+### Per-step reward
 
 ```python
 density_gain = curr_density - prev_density
-density_term = alpha * (300 * positive_density_gain + 120 * negative_density_gain)
-x_depth_penalty = x_depth_penalty_scale * (x_depth_normalized ** 2)
-reward = density_term - x_depth_penalty
-reward -= overlap penalties
-reward -= settle drift penalty when drift exceeds margin
+reward = alpha * 100.0 * density_gain
 ```
 
-There are also terminal bonuses and penalties:
+That is all. There are no explicit overlap, drift, or x-depth penalty
+terms. The density denominator
+(`max_x_reached * truck_width * truck_height`) already punishes
+unnecessarily deep placements because increasing `max_x_reached`
+shrinks the ratio. `density_gain` can be negative when a new placement
+pushes existing boxes around or extends the running extent faster than
+it adds volume, so the step reward can be negative even outside
+terminations — the agent learns to avoid that on its own.
 
-- unstable placements terminate the episode
-- hitting the density threshold terminates with a success-style bonus
-- completing all boxes terminates with a final density/void bonus
-- out-of-container is tracked, but it is currently configured **not** to terminate episodes during SAC training
+### Termination ladder and terminal rewards
+
+Checked in this order, highest-priority first. Only the first matching
+condition fires per step:
+
+| Condition | Reward delta | `termination_reason` |
+|---|---|---|
+| placed box leaves the truck (if `terminate_on_out_of_container=True`) | `-out_of_container_penalty` | `out_of_container` |
+| three or more previously-placed boxes have drifted (`n_displaced >= 3`) | **`-10.0`** | `unstable` |
+| `density >= stop_density` (default `0.8`) | `+ density * (1 - void) * 500` | `density_threshold` |
+| all `n_boxes` have been placed | `+ density * (1 - void) * 500` | `complete` |
+| `current_step >= max_steps` | `0` | `time_limit` (truncation) |
+
+The `-10.0` on `unstable` is intentionally small and flat rather than
+scaled by the damage done: it gives the critic a consistent bad anchor
+for toppling without creating a reward cliff large enough to drown out
+the density-gain signal. Successful terminations get a density-weighted
+void-aware bonus so that *how tightly packed* the completed stack is
+still matters.
+
+### Why this form
+
+Earlier reward variants combined density gain with explicit overlap,
+drift, and x-depth penalties. In practice those terms dominated early
+training and kept returns pinned near zero regardless of placement
+quality. Collapsing the reward to `density_gain * 100` with a flat
+`-10` unstable penalty made the objective cleaner to optimize and
+recovered positive learning curves. The shaping parameters
+(`overlap_penalty_scale`, `x_depth_penalty_scale`, `lambda_unstable`,
+etc.) are kept in the env signature for backwards compatibility but
+default to `0` and are not added to the reward in the current code
+path.
 
 Useful info fields emitted by the environment include:
 
@@ -354,14 +387,132 @@ python sac.py \
 - `--buffer-size`: replay buffer size
 - `--total-episodes`: stop condition based on completed episodes
 - `--total-timesteps`: hard safety cap on environment steps
+- `--resume`: path to a checkpoint `.pt` file to resume training from (see
+  "Model Checkpoints" below)
 
-Training logs are written under `runs/`.
+Training logs are written under `runs/`. Each run's directory is named
+
+```
+runs/<env_id>__<exp_name>__n<n_boxes>__<seed>__<unix_timestamp>/
+```
+
+so that curriculum stages with different `n_boxes` are easy to tell
+apart at a glance.
 
 To inspect metrics:
 
 ```bash
 tensorboard --logdir runs
 ```
+
+## Model Checkpoints
+
+At the end of every training run, `sac.py` writes a single checkpoint
+file into the `model/` directory (created on demand). The filename is:
+
+```
+model/<exp_name>_n<n_boxes>_<index>.pt
+```
+
+where `<index>` auto-increments against any existing files that already
+share the `<exp_name>_n<n_boxes>` prefix. So the first run with
+`--exp-name sac --n-boxes 15` produces `model/sac_n15_1.pt`, the second
+produces `model/sac_n15_2.pt`, and so on. The `n<n_boxes>` piece makes
+curriculum stages easy to organize without overwriting each other.
+
+Each checkpoint is a single `torch.save(...)` dict with everything
+needed to resume training faithfully:
+
+- `actor`, `qf1`, `qf2`, `qf1_target`, `qf2_target` — network state dicts
+- `actor_optimizer`, `q_optimizer` — Adam states for the policy and the
+  twin Q-critics
+- `log_alpha`, `a_optimizer` — entropy coefficient and its optimizer
+  state (when `--autotune` is on, which is the default)
+- `global_step`, `episode_count` — for logging continuity
+- `args` — the full parsed `Args` dataclass as a dict, for reproducibility
+
+To resume from a checkpoint pass `--resume` with the path:
+
+```bash
+python sac.py \
+    --num-envs 4 \
+    --total-timesteps 120000 \
+    --learning-starts 500 \
+    --n-boxes 30 \
+    --n-sequences 10 \
+    --resume model/sac_n15_1.pt
+```
+
+On resume, the script skips the uniform-random exploration period
+(`--learning-starts` still controls when gradient updates start, but
+actions come from the loaded policy instead of random samples) so the
+replay buffer refills with on-policy-quality transitions from step 0.
+
+## Curriculum Learning
+
+The environment gets harder non-linearly as `n_boxes` grows: failure
+modes compound, stability grids get denser, and the terminal density
+ceiling climbs. Training directly on `--n-boxes 200` from a
+freshly-initialized policy produces very few `complete` terminations in
+reasonable wall-clock time.
+
+The practical workaround is a curriculum: train a policy on a small
+`n_boxes`, checkpoint it, then resume into a larger `n_boxes` using
+`--resume`. The smaller-task policy already knows how to place boxes
+without toppling, so it converges faster on the larger task than a
+from-scratch agent does.
+
+A typical three-stage curriculum looks like this:
+
+```bash
+# Stage 1: 15-box warm-up. Lots of complete terminations,
+# agent learns the basic "don't topple, fill the back wall" behavior.
+python sac.py \
+    --num-envs 4 \
+    --total-timesteps 80000 \
+    --learning-starts 2000 \
+    --n-boxes 15 \
+    --n-sequences 10
+# -> model/sac_n15_1.pt
+
+# Stage 2: 30-box refinement. Resume from stage 1.
+# Use a smaller --learning-starts since the policy is already
+# useful and we want gradient updates flowing almost immediately.
+python sac.py \
+    --num-envs 4 \
+    --total-timesteps 120000 \
+    --learning-starts 500 \
+    --n-boxes 30 \
+    --n-sequences 10 \
+    --resume model/sac_n15_1.pt
+# -> model/sac_n30_1.pt
+
+# Stage 3: 100-box target. Resume from stage 2.
+python sac.py \
+    --num-envs 4 \
+    --total-timesteps 250000 \
+    --learning-starts 500 \
+    --n-boxes 100 \
+    --n-sequences 20 \
+    --resume model/sac_n30_1.pt
+# -> model/sac_n100_1.pt
+```
+
+Rough heuristics for when a stage is "done" and you can graduate to
+the next one:
+
+- the `complete` termination rate is reliably above ~20%, and
+- the mean density on `complete` episodes is climbing into the
+  0.4+ range, and
+- the max density on `unstable` episodes is close to the density on
+  recent `complete` episodes (the agent is "almost getting it right"
+  even when it fails).
+
+Note that the critic and entropy coefficient reset their target
+distributions when `n_boxes` changes, because reward magnitudes scale
+with episode length. Give the resumed run a few thousand steps before
+evaluating it — early `qf_loss` and `alpha` can look noisy until the
+value head recalibrates to the new horizon.
 
 ## Box Sequence Generation
 
@@ -443,16 +594,33 @@ On an RTX 5070 Ti, the capability should report `(12, 0)`.
 
 ## Quick Start
 
-From the repo root:
+From the repo root, a minimum end-to-end smoke test:
 
 ```bash
 python sim_details/get_boxes.py --n_boxes 100
-python sac.py --num-envs 1 --total-episodes 100 --n-boxes 20 --n-sequences 10
+python sac.py --num-envs 1 --total-timesteps 20000 --n-boxes 15 --n-sequences 10
 tensorboard --logdir runs
 ```
+
+This trains a small curriculum-stage-1 policy on 15-box episodes and
+saves `model/sac_n15_1.pt` when it finishes. To continue from that
+checkpoint into a harder task, re-launch with `--resume`:
+
+```bash
+python sac.py \
+    --num-envs 4 \
+    --total-timesteps 120000 \
+    --learning-starts 500 \
+    --n-boxes 30 \
+    --n-sequences 10 \
+    --resume model/sac_n15_1.pt
+```
+
+See "Curriculum Learning" above for the full recommended multi-stage
+recipe.
 
 If you want to watch the policy live on macOS:
 
 ```bash
-mjpython sac.py --num-envs 1 --render --render-envs 1 --total-episodes 20 --n-boxes 20 --n-sequences 10
+mjpython sac.py --num-envs 1 --render --render-envs 1 --total-timesteps 20000 --n-boxes 15 --n-sequences 10
 ```

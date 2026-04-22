@@ -1063,6 +1063,7 @@ class MujocoTruckEnv(gym.Env):
             terminated = True
             termination_reason = "out_of_container"
         elif n_displaced >= 3:
+            reward -= 10.0
             terminated = True
             termination_reason = "unstable"
         elif curr_density >= self.stop_density:
