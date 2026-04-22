@@ -215,16 +215,16 @@ class MujocoTruckEnv(gym.Env):
         settle_angvel_eps: float = 0.05,
         settle_consecutive_steps: int = 15,
         max_steps: int = 916,
-        alpha: float = 1.0, #
-        beta: float = 1.0,
-        lambda_unstable: float = 50.0,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        lambda_unstable: float = 0.0,
         stop_density: float = 0.8,
         overlap_tol: float = 1e-4,
-        overlap_precheck_penalty: float = 75.0,
-        overlap_penalty_scale: float = 150.0,
+        overlap_precheck_penalty: float = 0.0,
+        overlap_penalty_scale: float = 0.0,
         settle_drift_margin: float = 0.03,
-        x_depth_penalty_scale: float = 8.0,
-        drift_penalty_scale: float = 40.0,
+        x_depth_penalty_scale: float = 0.0,
+        drift_penalty_scale: float = 0.0,
         out_of_container_penalty: float = 200.0,
         out_of_container_tol: float = 0.01,
         terminate_on_out_of_container: bool = False,
@@ -1036,27 +1036,23 @@ class MujocoTruckEnv(gym.Env):
         )
 
         density_gain = float(curr_density - self.prev_density)
-        # Density shaping:
-        # reward positive density gains strongly; penalize regressions more lightly.
-        density_gain_pos = max(0.0, density_gain)
-        density_gain_neg = min(0.0, density_gain)
-        density_term = self.alpha * (300.0 * density_gain_pos + 120.0 * density_gain_neg)
-        # Depth penalty shaping:
-        # penalize larger x; strongest penalty near the truck-depth end.
+        # Reward is density gain only. Stability, overlap, drift, and depth
+        # shaping are all handled implicitly: unstable stacks terminate the
+        # episode (no more density rewards), and the density denominator
+        # (max_x_reached * truck_width * truck_height) already penalizes
+        # pushing boxes deeper into the truck or letting them drift.
+        density_term = self.alpha * 100.0 * density_gain
         x_depth_normalized = float(
             np.clip(settled_api[0] / max(1e-9, float(TRUCK["depth"])), 0.0, 1.0)
         )
-        x_depth_penalty = self.x_depth_penalty_scale * float(x_depth_normalized**2)
+        x_depth_penalty = 0.0
         stability_term = 0.0
         void_compact_term = 0.0
-        step_reward = density_term - x_depth_penalty
+        overlap_penalty = 0.0
+        drift_exceeds_margin = False
+        drift_penalty = 0.0
+        step_reward = density_term
         reward = float(step_reward)
-        reward -= precheck_penalty
-        overlap_penalty = self.overlap_penalty_scale * float(post_settle_overlap)
-        drift_exceeds_margin = bool(settle_drift > self.settle_drift_margin)
-        drift_penalty = float(self.beta) if drift_exceeds_margin else 0.0
-        reward -= overlap_penalty
-        reward -= drift_penalty
 
         terminated = False
         truncated = False
@@ -1067,7 +1063,6 @@ class MujocoTruckEnv(gym.Env):
             terminated = True
             termination_reason = "out_of_container"
         elif n_displaced >= 3:
-            reward += -self.lambda_unstable * float(n_displaced) * float(avg_disp)
             terminated = True
             termination_reason = "unstable"
         elif curr_density >= self.stop_density:

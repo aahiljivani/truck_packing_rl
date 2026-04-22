@@ -52,7 +52,7 @@ class Args:
     """With ``--render``, how many vector sub-envs (indices ``0 .. K-1``) use ``render_mode=\"human\"``"""
     total_timesteps: int = 100_000
     """Failsafe upper bound on environment steps"""
-    total_episodes: int = 100
+    total_episodes: int = 10_000_000
     """Stop after this many completed episodes (aggregate across vector envs)"""
     num_envs: int = 1
     """the number of parallel game environments"""

@@ -400,17 +400,46 @@ If training appears stalled, the most important things to inspect are:
 
 ## Dependencies
 
-The code expects a Python environment with at least:
+All runtime dependencies are pinned in [`requirements.txt`](requirements.txt). The
+recommended install flow inside a fresh conda environment is:
 
+```bash
+conda create -n truck_packing python=3.13 -y
+conda activate truck_packing
+pip install -r requirements.txt
+```
+
+Core packages:
+
+- `torch` (CUDA 12.8 wheel, see note below)
 - `mujoco`
 - `gymnasium`
 - `numpy`
-- `torch`
 - `tyro`
 - `tensorboard`
 - `requests`
 
 Some older experimentation scripts also import `jax`.
+
+### GPU note: RTX 50-series / Blackwell (sm_120)
+
+`requirements.txt` pulls `torch` from the PyTorch CUDA 12.8 wheel index
+(`https://download.pytorch.org/whl/cu128`) via `--extra-index-url`. This is
+required on RTX 5070 Ti and other Blackwell cards: PyPI's default `torch`
+wheel is built against CUDA 12.6 and ships without `sm_120` kernels, so it
+will either fall back to slow JIT or fail with "CUDA error: no kernel image
+is available for execution on this device". Older GPUs (Ampere, Ada) are
+unaffected — the `cu128` wheel runs on them as well.
+
+After install, you can sanity-check the build with:
+
+```python
+import torch
+print(torch.__version__, torch.version.cuda)
+print(torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))
+```
+
+On an RTX 5070 Ti, the capability should report `(12, 0)`.
 
 ## Quick Start
 
