@@ -1,6 +1,7 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 
@@ -398,6 +399,25 @@ if __name__ == "__main__":
                 )
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+# save model to folder model and name them based on the algorithm name and index
+    os.makedirs("model", exist_ok=True)
+    pattern = re.compile(rf"^{re.escape(args.exp_name)}_(\d+)\.pt$")
+    existing = [int(m.group(1)) for f in os.listdir("model") if (m := pattern.match(f))]
+    next_idx = max(existing, default=0) + 1
+    model_path = os.path.join("model", f"{args.exp_name}_{next_idx}.pt")
+
+    torch.save(
+        {
+            "actor": actor.state_dict(),
+            "qf1": qf1.state_dict(),
+            "qf2": qf2.state_dict(),
+            "qf1_target": qf1_target.state_dict(),
+            "qf2_target": qf2_target.state_dict(),
+            "args": vars(args),
+        },
+        model_path,
+    )
+    print(f"[save] Model saved to {model_path}")
 
     envs.close()
     writer.close()
