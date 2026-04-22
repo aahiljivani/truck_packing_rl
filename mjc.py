@@ -34,6 +34,12 @@ TRUCK: dict[str, float] = {"depth": 2.0, "width": 2.6, "height": 2.75}
 
 TRUCK_OFFSET: np.ndarray = np.array([1.0, 1.3, 0.0], dtype=np.float64)
 
+# Observation normalization scales. Box dims in ``sim_details/box_dimensions.json``
+# are already in [0, 1], so only weight and the reached-extent scalars need
+# explicit scaling. ``WEIGHT_SCALE`` is a kg cap used to map ``w_b`` into [0, 1];
+# raise it if observed weights routinely exceed this value.
+WEIGHT_SCALE: float = 50.0
+
 IDENTITY_DIMS_MAP: dict[tuple[float, float, float, float], Any] = {
     (1.0, 0.0, 0.0, 0.0):     lambda l, w, h: (l, w, h),
     (0.707, 0.0, 0.0, 0.707): lambda l, w, h: (w, l, h),
@@ -165,12 +171,24 @@ def json_box_sequence(
 class MujocoTruckEnv(gym.Env):
     """Gymnasium env that locally simulates truck packing with MuJoCo.
 
-    Observation (shape ``(9 + 2 * grid_x * grid_y,)``, float32; default 41 for a
-    ``4×4`` grid):
+    Observation (shape ``(9 + 3 * grid_x * grid_y,)``, float32, all values in
+    ``[0, 1]``; default 57 for a ``4×4`` grid):
 
-        [l, w, h, w_b, max_x, max_y, max_z, density ρ, void v,
+        [l, w, h, w_b_norm, max_x_norm, max_y_norm, max_z_norm, density ρ, void v,
          grid_stability flattened row-major (xi fastest),
-         grid_count_norm flattened row-major]
+         grid_count_norm flattened row-major,
+         grid_height_norm flattened row-major]
+
+    Scalar normalization: box dims ``l, w, h`` are assumed already in ``[0, 1]``
+    (the pooled dimensions in ``sim_details/box_dimensions.json`` satisfy this);
+    ``w_b`` is divided by ``WEIGHT_SCALE`` and clipped to ``[0, 1]``; ``max_x``,
+    ``max_y``, ``max_z`` are divided by ``TRUCK["depth"]``, ``TRUCK["width"]``,
+    ``TRUCK["height"]`` respectively. Raw-unit values are still emitted in
+    ``info`` for diagnostics.
+
+    The height grid uses orientation-aware footprint rasterization: each placed
+    box contributes its top ``center_z + h_o / 2`` to every cell its oriented
+    XY footprint overlaps, normalized by ``TRUCK["height"]``.
 
     Action (shape (4,), float32):
         [x, y, z, s] in API frame (corner-origin). ``x, y, z`` are the box
@@ -253,10 +271,10 @@ class MujocoTruckEnv(gym.Env):
         self.render_mode = render_mode
         self._dimensions_pool = dimensions_pool
 
-        obs_dim = 9 + 2 * self.grid_x * self.grid_y
+        obs_dim = 9 + 3 * self.grid_x * self.grid_y
         self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
+            low=0.0,
+            high=1.0,
             shape=(obs_dim,),
             dtype=np.float32,
         )
@@ -298,9 +316,9 @@ class MujocoTruckEnv(gym.Env):
         self._viewer: Any | None = None
         self._birdseye_transition_id: int = -1
         self._birdseye_cache_tid: int = -2
-        self._birdseye_cache: tuple[np.ndarray, np.ndarray, float, float, float] | None = (
-            None
-        )
+        self._birdseye_cache: tuple[
+            np.ndarray, np.ndarray, np.ndarray, float, float, float, float
+        ] | None = None
         # **DO NOT DELETE THIS COMMENT. THESE ARE DEVELOPER NOTES.** I read up to here and I know what is going on.
 
     def _json_box_sequence(self) -> dict[int, dict[str, Any]]:
@@ -526,7 +544,14 @@ class MujocoTruckEnv(gym.Env):
         return self._get_obs(), self._get_info()
 
     def _get_obs(self) -> np.ndarray:
-        """Assemble the observation vector (global scalars + bird's-eye grids)."""
+        """Assemble the observation vector (normalized scalars + bird's-eye grids).
+
+        All scalars are mapped into ``[0, 1]``: box dims ``l, w, h`` are assumed
+        already normalized by the pool; ``w_b`` is divided by ``WEIGHT_SCALE``
+        and clipped; ``max_*`` extents are divided by the corresponding
+        ``TRUCK`` axis; density and void are already ``[0, 1]``. Grids
+        (stability, count, height) are already ``[0, 1]``.
+        """
         if self.current_step < len(self.dimensions):
             l, w, h = self.dimensions[self.current_step]["dimensions"]
             w_b = float(self.dimensions[self.current_step]["weight"])
@@ -535,7 +560,13 @@ class MujocoTruckEnv(gym.Env):
             w_b = 0.0
         rho = float(self._compute_density())
         v = float(self._compute_void_ratio())
-        stab, cnorm, _, _, _ = self._compute_birdseye_grids()
+        stab, cnorm, hnorm, _, _, _, _ = self._compute_birdseye_grids()
+
+        w_b_norm = min(float(w_b) / WEIGHT_SCALE, 1.0)
+        max_x_norm = float(self.max_x_reached) / TRUCK["depth"]
+        max_y_norm = float(self.max_y_reached) / TRUCK["width"]
+        max_z_norm = float(self.max_z_reached) / TRUCK["height"]
+
         return np.concatenate(
             [
                 np.array(
@@ -543,10 +574,10 @@ class MujocoTruckEnv(gym.Env):
                         float(l),
                         float(w),
                         float(h),
-                        float(w_b),
-                        float(self.max_x_reached),
-                        float(self.max_y_reached),
-                        float(self.max_z_reached),
+                        w_b_norm,
+                        max_x_norm,
+                        max_y_norm,
+                        max_z_norm,
                         rho,
                         v,
                     ],
@@ -554,6 +585,7 @@ class MujocoTruckEnv(gym.Env):
                 ),
                 stab,
                 cnorm,
+                hnorm,
             ],
             axis=0,
         )
@@ -670,12 +702,23 @@ class MujocoTruckEnv(gym.Env):
         v = 1.0 - occupied / bounding
         return float(np.clip(v, 0.0, 1.0))
 
-    def _compute_birdseye_grids(self) -> tuple[np.ndarray, np.ndarray, float, float, float]:
-        """Per-cell stability (from mean drift) and normalized counts (bird's-eye).
+    def _compute_birdseye_grids(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float]:
+        """Per-cell stability, counts, and max top height (bird's-eye).
 
-        Uses post-settle recorded centers in ``placement_positions`` (MuJoCo frame)
-        mapped into truck API `(x,y)` via ``TRUCK_OFFSET`` for cell indexing.
+        Stability and count use the box center for cell assignment (matching the
+        original convention). Height uses footprint rasterization: each placed
+        box's oriented XY footprint ``(l_o, w_o)`` contributes its top
+        ``center_z + h_o / 2`` to every cell it overlaps, normalized by
+        ``TRUCK["height"]``. Oriented dims come from
+        ``IDENTITY_DIMS_MAP[orientation_wxyz]``.
+
         Row-major flattening: ``k = xi * grid_y + yi``.
+
+        Returns:
+            (stability, count_norm, height_norm, stab_mean, cell_disp_max,
+             counts_sum, height_max)
         """
         if (
             self._birdseye_cache is not None
@@ -688,20 +731,23 @@ class MujocoTruckEnv(gym.Env):
         sum_d = np.zeros((gx, gy), dtype=np.float64)
         cnt_d = np.zeros((gx, gy), dtype=np.int32)
         counts = np.zeros((gx, gy), dtype=np.int32)
+        height_mat = np.zeros((gx, gy), dtype=np.float64)
 
         if self.model is None or self.data is None or len(self.placed_indices) == 0:
             stability = np.ones(n_cells, dtype=np.float32)
             count_norm = np.zeros(n_cells, dtype=np.float32)
-            out = (stability, count_norm, 1.0, 0.0, 0.0)
+            height_norm = np.zeros(n_cells, dtype=np.float32)
+            out = (stability, count_norm, height_norm, 1.0, 0.0, 0.0, 0.0)
             self._birdseye_cache = out
             self._birdseye_cache_tid = self._birdseye_transition_id
             return out
 
         cell_dx = float(TRUCK["depth"]) / float(gx)
         cell_dy = float(TRUCK["width"]) / float(gy)
+        truck_h = float(TRUCK["height"])
         n_max = max(1, int(self.grid_n_max))
 
-        for j in self.placed_indices:
+        for j, b in zip(self.placed_indices, self.placed_boxes):
             if j not in self.placement_positions:
                 continue
             cur_mj = self._get_box_position(j)
@@ -711,11 +757,35 @@ class MujocoTruckEnv(gym.Env):
             pos_api = cur_mj + TRUCK_OFFSET
             cx_api = float(pos_api[0])
             cy_api = float(pos_api[1])
+            cz_api = float(pos_api[2])
+
+            # Center-based bucketing for stability and count (unchanged).
             xi = int(np.clip(cx_api / cell_dx, 0, gx - 1))
             yi = int(np.clip(cy_api / cell_dy, 0, gy - 1))
             sum_d[xi, yi] += dist
             cnt_d[xi, yi] += 1
             counts[xi, yi] += 1
+
+            # Orientation-aware oriented dims for footprint rasterization.
+            quat_key = tuple(float(x) for x in b["orientation_wxyz"])
+            l, w, h = (float(x) for x in b["dimensions"])
+            mapper = IDENTITY_DIMS_MAP.get(quat_key)
+            if mapper is None:
+                l_o, w_o, h_o = l, w, h
+            else:
+                l_o, w_o, h_o = mapper(l, w, h)
+
+            half_lo = l_o / 2.0
+            half_wo = w_o / 2.0
+            half_ho = h_o / 2.0
+            top = cz_api + half_ho
+
+            xi_lo = int(np.clip(np.floor((cx_api - half_lo) / cell_dx), 0, gx - 1))
+            xi_hi = int(np.clip(np.floor((cx_api + half_lo) / cell_dx), 0, gx - 1))
+            yi_lo = int(np.clip(np.floor((cy_api - half_wo) / cell_dy), 0, gy - 1))
+            yi_hi = int(np.clip(np.floor((cy_api + half_wo) / cell_dy), 0, gy - 1))
+            sub = height_mat[xi_lo : xi_hi + 1, yi_lo : yi_hi + 1]
+            np.maximum(sub, top, out=sub)
 
         mean_d = np.zeros((gx, gy), dtype=np.float64)
         mask = cnt_d > 0
@@ -725,15 +795,28 @@ class MujocoTruckEnv(gym.Env):
         count_mat = np.clip(counts.astype(np.float64) / float(n_max), 0.0, 1.0).astype(
             np.float32
         )
+        height_mat_norm = np.clip(height_mat / max(truck_h, 1e-9), 0.0, 1.0).astype(
+            np.float32
+        )
 
         # Row-major: xi varies fastest across the flattened vector.
         stability = stab_mat.reshape(-1, order="C")
         count_norm = count_mat.reshape(-1, order="C")
+        height_norm = height_mat_norm.reshape(-1, order="C")
 
         stab_mean = float(np.mean(stability)) if stability.size else 1.0
         cell_disp_max = float(np.max(mean_d)) if mean_d.size else 0.0
         counts_sum = float(np.sum(counts))
-        out = (stability, count_norm, stab_mean, cell_disp_max, counts_sum)
+        height_max = float(np.max(height_mat)) if height_mat.size else 0.0
+        out = (
+            stability,
+            count_norm,
+            height_norm,
+            stab_mean,
+            cell_disp_max,
+            counts_sum,
+            height_max,
+        )
         self._birdseye_cache = out
         self._birdseye_cache_tid = self._birdseye_transition_id
         return out
@@ -1032,13 +1115,20 @@ class MujocoTruckEnv(gym.Env):
         info["drift_exceeds_margin"] = drift_exceeds_margin
         info["drift_penalty"] = float(drift_penalty)
         info["out_of_container"] = out_of_container
-        _stab, _cnorm, grid_stab_mean, grid_cell_disp_max, grid_counts_sum = (
-            self._compute_birdseye_grids()
-        )
+        (
+            _stab,
+            _cnorm,
+            _hnorm,
+            grid_stab_mean,
+            grid_cell_disp_max,
+            grid_counts_sum,
+            grid_height_max,
+        ) = self._compute_birdseye_grids()
         info["grid_stability_mean"] = float(grid_stab_mean)
         info["grid_cell_disp_max"] = float(grid_cell_disp_max)
         info["grid_counts_sum"] = float(grid_counts_sum)
         info["grid_n_max"] = int(self.grid_n_max)
+        info["grid_height_max"] = float(grid_height_max)
         if precheck_penalty > 0.0 and termination_reason is None:
             info["reason"] = "overlap_precheck_penalty"
         if termination_reason is not None:
