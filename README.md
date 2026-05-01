@@ -1,13 +1,13 @@
 # MuJoCo Truck Packing
 
-This repository contains a MuJoCo-based truck-packing environment plus a Soft Actor-Critic (SAC) training script for learning box placement policies. The setup is modeled after the Dexterity truck packing challenge: boxes arrive one at a time, the agent chooses a placement and orientation, MuJoCo settles the physics, and the environment returns an observation, reward, and termination signal.
+This repository contains a MuJoCo-based truck-packing environment plus a Soft Actor-Critic (SAC) training script adapted from CleanRL for learning box placement policies. The setup is modeled after the Dexterity truck packing challenge: boxes arrive one at a time, the agent chooses a placement and orientation, MuJoCo settles the physics, and the environment returns an observation, reward, and termination signal.
 
-The codebase currently focuses on fast iteration for reward design and training experiments rather than polished packaging. The main workflow is:
+The codebase currently focuses on fast iteration for reward design and training experiments. Given the timeframe of 2 weeks to work on the problem, the simulation is not as polished as I would like it to be. The main workflow is:
 
-1. Generate or reuse a pool of box dimensions.
+1. Collect a sample of box dimensions and weights from 'dev' mode and save them to a json file.
 2. Build a MuJoCo environment that simulates truck packing locally. All observations are normalized to `[0, 1]` and include three bird's-eye grids (stability, count, height).
 3. Train a continuous-control SAC policy over box placements.
-4. Inspect reward, density, and episode metrics in TensorBoard or the passive viewer.
+4. Inspect reward, density, and episode metrics in CLI.
 
 ## Repository Structure
 
@@ -533,22 +533,6 @@ The training script can then sample from that cached pool using `json_box_sequen
 - On macOS, `mjpython` is the safer entry point for viewer-based runs.
 - Rendering many vector envs at once is expensive; start with `--num-envs 1`.
 
-## Development Notes
-
-This project is currently optimized for experimentation:
-
-- reward shaping is changing frequently
-- some defaults are intentionally tuned for quick smoke tests
-- diagnostics in `info` are richer than the public API state because they are meant to support RL debugging
-
-If training appears stalled, the most important things to inspect are:
-
-- `charts/episodic_return`
-- `charts/density`
-- termination reasons printed by `sac.py`
-- overlap and drift penalties in env `info`
-- whether the x-depth penalty is overpowering density gains
-
 ## Dependencies
 
 All runtime dependencies are pinned in [`requirements.txt`](requirements.txt). The
@@ -614,13 +598,4 @@ python sac.py \
     --n-boxes 30 \
     --n-sequences 10 \
     --resume model/sac_n15_1.pt
-```
-
-See "Curriculum Learning" above for the full recommended multi-stage
-recipe.
-
-If you want to watch the policy live on macOS:
-
-```bash
-mjpython sac.py --num-envs 1 --render --render-envs 1 --total-timesteps 20000 --n-boxes 15 --n-sequences 10
 ```
